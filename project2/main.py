@@ -8,57 +8,33 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from mpi4py import MPI
+from utils import mesh, mass, stiffness, plot_mesh, point_source
 
+#Global Variables
 na = np.newaxis
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-
-def mesh(nx,ny,Lx,Ly):
-   i = np.arange(0,nx)[na,:] * np.ones((ny,1), np.int64)
-   j = np.arange(0,ny)[:,na] * np.ones((1,nx), np.int64)
-   p = np.zeros((2,ny-1,nx-1,3), np.int64)
-   q = i+nx*j
-   p[:,:,:,0] = q[:-1,:-1]
-   p[0,:,:,1] = q[1: ,1: ]
-   p[0,:,:,2] = q[1: ,:-1]
-   p[1,:,:,1] = q[:-1,1: ]
-   p[1,:,:,2] = q[1: ,1: ]
-   v = np.concatenate(((Lx/(nx-1)*i)[:,:,na], (Ly/(ny-1)*j)[:,:,na]), axis=2)
-   vtx = np.reshape(v, (nx*ny,2))
-   elt = np.reshape(p, (2*(nx-1)*(ny-1),3))
-   return vtx, elt 
-
-
-
-
 def local_mesh(Lx, Ly, nx, ny):
     # Get MPI parameters
     J = size
     j = rank
-
     # Number of points per subdomain in y (with interface sharing)
     ny_loc = (ny - 1) // J + 1
-
     # Local vertical size
     Ly_loc = Ly / J
-
     # Build local mesh
     vtx_loc, elt_loc = mesh(nx, ny_loc, Lx, Ly_loc)
-
     # Shift to global y-position
     vtx_loc[:, 1] += j * Ly_loc
-
     return vtx_loc, elt_loc
 
 
 def local_boundary(nx, ny, j, J):
     ny_loc = (ny - 1) // J + 1
-
     phys = []
     artf = []
-
     # Bottom boundary 
     # important to notice that only the first subdomain has physical bottom boundary
     for i in range(nx - 1):
@@ -67,7 +43,6 @@ def local_boundary(nx, ny, j, J):
             phys.append(edge)
         else:
             artf.append(edge)
-
     # Top boundary
     # important to notice that only the last subdomain has physical top boundary
     offset = (ny_loc - 1) * nx
@@ -77,15 +52,12 @@ def local_boundary(nx, ny, j, J):
             phys.append(edge)
         else:
             artf.append(edge)
-
     # Left-Right boundary (always physical)
     for k in range(ny_loc - 1):
         phys.append([k * nx, (k + 1) * nx])
-
     for k in range(ny_loc - 1):
         phys.append([k * nx + nx - 1,
                      (k + 1) * nx + nx - 1])
-
     return np.array(phys, dtype=int), np.array(artf, dtype=int)
 
 
@@ -96,15 +68,12 @@ def Rj_matrix(nx, ny, j, J):
     #  Define the mapping (Local index i maps to Global index k)
     # Local indices are simply 0, 1, 2... nv_loc-1
     rows = np.arange(0, nv_loc, 1, dtype=np.int64)
-    
     # Global indices are shifted based on the subdomain index 'j'
     # The shift (ny_loc - 1) * nx moves the "window" down the global vector
     cols = rows + j * (ny_loc - 1) * nx
-    
     # Fill the matrix with 1s
     # Each row of Rj has a single '1' at the column corresponding to the global node
     data = np.ones(nv_loc, dtype=np.float64)
-    
     # Create the Sparse Matrix
     # Shape is (local_nodes, global_nodes)
     Rj = csr_matrix((data, (rows, cols)), shape=(nv_loc, nv), dtype=np.float64)
@@ -128,7 +97,6 @@ def Cj_matrix(nx, ny, j, J):
     nv_loc = nx * ny_loc
     sizeCrow = (J - 1) * nx
     sizeCcol = nx if j == 0 or j == J - 1 else 2 * nx   
-
     rows = np.arange(0, sizeCrow, 1, dtype=np.int64)
     cols = np.zeros(sizeCcol, dtype=np.int64)
     if j == 0:
@@ -138,84 +106,10 @@ def Cj_matrix(nx, ny, j, J):
     else:
         cols[:nx] = np.arange(0, nx, 1, dtype=np.int64)
         cols[nx:] = np.arange((ny_loc - 1) * nx, ny_loc * nx, 1, dtype=np.int64)
-    
     data = np.ones(sizeCrow, dtype=np.float64)
     Cj = csr_matrix((data, (rows, cols)), shape=(sizeCrow, sizeCcol), dtype=np.float64)
     return Cj
 
-def boundary(nx, ny):
-    bottom = np.hstack((np.arange(0,nx-1,1)[:,na],
-                        np.arange(1,nx,1)[:,na]))
-    top    = np.hstack((np.arange(nx*(ny-1),nx*ny-1,1)[:,na],
-                        np.arange(nx*(ny-1)+1,nx*ny,1)[:,na]))
-    left   = np.hstack((np.arange(0,nx*(ny-1),nx)[:,na],
-                        np.arange(nx,nx*ny,nx)[:,na]))
-    right  = np.hstack((np.arange(nx-1,nx*(ny-1),nx)[:,na],
-                        np.arange(2*nx-1,nx*ny,nx)[:,na]))
-    return np.vstack((bottom, top, left, right))
-
-def get_area(vtx, elt):
-    d = np.size(elt, 1)
-    if d == 2:
-        e = vtx[elt[:, 1], :] - vtx[elt[:, 0], :]
-        areas = la.norm(e, axis=1)
-    else:
-        e1 = vtx[elt[:, 1], :] - vtx[elt[:, 0], :]
-        e2 = vtx[elt[:, 2], :] - vtx[elt[:, 0], :]
-        areas = 0.5 * np.abs(e1[:,0] * e2[:,1] - e1[:,1] * e2[:,0])
-    return areas
-
-def mass(vtx, elt):
-    nv = np.size(vtx, 0)
-    d = np.size(elt, 1)
-    areas = get_area(vtx, elt)
-    M = csr_matrix((nv, nv), dtype=np.float64)
-    for j in range(d):
-        for k in range(d):
-           row = elt[:,j]
-           col = elt[:,k]
-           val = areas * (1 + (j == k)) / (d*(d+1))
-           M += csr_matrix((val, (row, col)), shape=(nv, nv))
-    return M
-
-def stiffness(vtx, elt):
-    nv = np.size(vtx, 0)
-    d = np.size(elt, 1)
-    areas = get_area(vtx, elt)
-    ne, d = np.shape(elt)
-    E = np.empty((ne, d, d-1), dtype=np.float64)
-    E[:,0,:] = 0.5 * (vtx[elt[:,1],0:2] - vtx[elt[:,2],0:2])
-    E[:,1,:] = 0.5 * (vtx[elt[:,2],0:2] - vtx[elt[:,0],0:2])
-    E[:,2,:] = 0.5 * (vtx[elt[:,0],0:2] - vtx[elt[:,1],0:2])
-    K = csr_matrix((nv, nv), dtype=np.float64)
-    for j in range(d):
-        for k in range(d):
-           row = elt[:,j]
-           col = elt[:,k]
-           val = np.sum(E[:,j,:] * E[:,k,:], axis=1) / areas
-           K += csr_matrix((val, (row, col)), shape=(nv, nv))
-    return K
-
-def point_source(sp, k):    
-    def ps(x):
-        v = np.zeros(np.size(x,0), float)
-        for s in sp:
-            v += s[2]*np.exp(-10*(k/(2.0*pi))**2 * la.norm(x - s[na,0:2], axis=1)**2)
-        return v
-    return ps 
-
-def plot_mesh(vtx, elt, val=None, **kwargs):
-    trig = mtri.Triangulation(vtx[:, 0], vtx[:, 1], elt)
-    if val is None:
-        plt.triplot(trig, **kwargs)
-    else:
-        plt.tripcolor(
-            trig, val,
-            shading='gouraud',
-            cmap=cm.jet,
-            **kwargs
-        )
-    plt.axis('equal')
 
 
 
@@ -224,7 +118,7 @@ def plot_mesh(vtx, elt, val=None, **kwargs):
 
 
 if __name__ == "__main__":
-    np.random.seed(1)
+    np.random.seed(1234)
     Lx = 1
     Ly = 2
     nx = int(1 + Lx * 32)
