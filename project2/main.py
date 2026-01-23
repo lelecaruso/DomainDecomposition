@@ -209,13 +209,45 @@ def bj_vector(vtxj, eltj, sp, k):
 
     return bj
 
+class ScatteringMatrix :
+    def __init__ (self, nx, ny, rank, size, vtx_loc, elt_loc, belt_phys, belt_artf, k):
+        self.Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
+        self.Cj = Cj_matrix(nx, ny, rank, size)
+        self.Tj = Tj_matrix(vtx_loc, belt_artf, self.Bj, k)
+        self.Sj_fact = Sj_factorization(self.Aj, self.Tj, self.Bj)
+
+    #x is the global vector of the interface 
+    def S(self, x):
+        xj = self.Cj @ x        
+        I = csr_matrix( np.eye( self.Bj.shape[0] ) )  
+        Sj = I + 2j * self.Bj * self.Sj_fact.solve( self.Bj.T @ self.Tj )
+        return Sj @ xj
+
+
+class ExchangeMatrix :
+    def __init__ (self, nx, ny, rank, size):
+        self.Cj = Cj_matrix(nx, ny, rank, size)
+        self.Tj = Tj_matrix(vtx_loc, belt_artf, self.Bj, k)
+        self.Sj_fact = Sj_factorization(self.Aj, self.Tj, self.Bj)
+        self.P_fact = spla.splu(csc_matrix(self.Cj.T @ self.Tj @ self.Cj))
+
+    def Pi(self, x):
+        xj = self.Cj @ x
+        I = csr_matrix( np.eye( self.Cj.shape[0] ) )
+        P = self.Cj @ self.P_fact.solve( self.Cj.T @ self.Tj )
+        PI = 2*P - I
+        return PI @ xj
+
+
+def g_vector(Bj, Cj, bj_vector, ExMtx):
+    return -2j * ExMtx.Pi( Bj @ ExMtx.Sj_fact.solve( Cj @ bj_vector ) )
 
 
 if __name__ == "__main__":
     np.random.seed(1234)
     Lx = 1
     Ly = 2
-    nx = int(1 + Lx * 3)
+    nx = int(1 + Lx * 4)
     ny = int(1 + Ly * 4)
 
     vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny)
@@ -236,11 +268,6 @@ if __name__ == "__main__":
     K = stiffness(vtx_loc, elt_loc)
     A = K - k**2 * M - 1j*k*Mb      # matrix of linear system 
     b = M @ point_source(sp,k)(vtx_loc) # linear system RHS (source term)
-    if rank == 0:
-        print("bj constructed = \n", Rj.T @ b)
-        bj = bj_vector(vtx_loc, elt_loc, sp, k)
-        print("bj_vector     = \n", bj)
-        print("Difference    = ", la.norm(Rj.T @ b - bj @ Rj))
     x = spla.spsolve(A, b)          # solution of linear system via direct solver
 
     # GMRES
