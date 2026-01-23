@@ -127,11 +127,13 @@ def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
     return Aj
 
 
-def Bj_matrix(nv_loc, belt_artf):
+def Bj_matrix(nx, ny, j, J, belt_artf):
     """
     Maps the local nodes (Omega_j) to the artificial interface (Sigma_j).
     Returns a matrix of size (nbelt_art x nv_loc).
     """
+    ny_loc = (ny - 1) // J + 1
+    nv_loc = nx * ny_loc
     # Number of nodes on the artificial interface
     # belt_artf contains pair of vertices, so we extract unique nodes
     interface_nodes = np.unique(belt_artf)
@@ -183,15 +185,15 @@ if __name__ == "__main__":
     np.random.seed(1234)
     Lx = 1
     Ly = 2
-    nx = int(1 + Lx * 2)
-    ny = int(1 + Ly * 2)
+    nx = int(1 + Lx * 3)
+    ny = int(1 + Ly * 4)
 
     vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny)
     belt_phys, belt_artf = local_boundary(nx, ny, rank, size)
     #Rj = Rj_matrix(nx, ny, rank, size)
     #Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
-    #j = Cj_matrix(nx, ny, rank, size)
-    #print(f"[Rank {rank}] " f"Vertices: {belt_artf.shape[0]}, "f"tot vtx: {nx * ny}, Cj = \n{Cj.todense()}")
+    Cj = Cj_matrix(nx, ny, rank, size)
+    print(f"[Rank {rank}] " f"Vertices: {belt_artf.shape[0]}, "f"tot vtx: {nx * ny}, Bj = \n{Cj.todense()}")
     belt = belt_phys
 
     print()
