@@ -79,16 +79,6 @@ def Rj_matrix(nx, ny, j, J):
     Rj = csr_matrix((data, (rows, cols)), shape=(nv_loc, nv), dtype=np.float64)
     return Rj
 
-def Bj_matrix(nx, ny, j, J, belt_artf):
-    ny_loc = (ny - 1) // J + 1
-    nv_loc = nx * ny_loc
-    nbelt = belt_artf.shape[0]
-    rows = np.arange(0, nbelt, 1, dtype=np.int64)
-    cols = rows + j * (ny_loc - 1) * nx
-    data = np.ones(nbelt, dtype=np.float64)
-    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt, nv_loc), dtype=np.float64)
-    return Bj
-
 def Cj_matrix(nx, ny, j, J):
     #define size of the matrix Cj which is:
     #the sum of the size of all interfaces x size of one interface
@@ -99,9 +89,9 @@ def Cj_matrix(nx, ny, j, J):
     sizeCcol = nx if j == 0 or j == J - 1 else 2 * nx   
     rows = np.arange(0, sizeCrow, 1, dtype=np.int64)
     cols = np.zeros(sizeCcol, dtype=np.int64)
-    if j == 0:
+    if j == J - 1:
         cols = np.arange(0, nx, 1, dtype=np.int64)
-    elif j == J - 1:
+    elif j == 0:
         cols = np.arange((ny_loc - 1) * nx, ny_loc * nx, 1, dtype=np.int64)
     else:
         cols[:nx] = np.arange(0, nx, 1, dtype=np.int64)
@@ -112,7 +102,79 @@ def Cj_matrix(nx, ny, j, J):
 
 
 
+def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
+    """
+    given the global assembly of A matrix:
+    M = mass(vtx_loc, elt_loc)
+    Mb = mass(vtx_loc, belt)
+    K = stiffness(vtx_loc, elt_loc)
+    A = K - k**2 * M - 1j * k * Mb  # matrix of linear system
+    """
+    #  Compute the local stiffness matrix
+    Kj = stiffness(vtxj, eltj)
 
+    # Compute the local mass matrix
+    Mj = mass(vtxj, eltj)
+
+    # 3. Compute the local boundary mass matrix for physical boundaries
+    # This represents the Robin/absorbing boundary condition (impedance)
+    Mbj = mass(vtxj, beltj_phys)
+
+    # 4. Assemble the local operator: A = K - k^2 * M - i * k * Mb
+    # Note: We use 1j for the imaginary unit
+    Aj = Kj - kappa**2 * Mj - 1j * kappa * Mbj
+
+    return Aj
+
+
+def Bj_matrix(nv_loc, belt_artf):
+    """
+    Maps the local nodes (Omega_j) to the artificial interface (Sigma_j).
+    Returns a matrix of size (nbelt_art x nv_loc).
+    """
+    # Number of nodes on the artificial interface
+    # belt_artf contains pair of vertices, so we extract unique nodes
+    interface_nodes = np.unique(belt_artf)
+    nbelt_nodes = len(interface_nodes)
+
+    rows = np.arange(nbelt_nodes)  # interface index
+    cols = interface_nodes  # local node indices: the actual node numbers in the subdomain mesh
+    data = np.ones(nbelt_nodes)
+
+    # Bj: (interface_nodes x local_nodes)
+    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt_nodes, nv_loc))
+    return Bj
+
+
+def Tj_matrix(vtxj, beltj_artf, Bj, k):
+    """
+    Constructs the mass matrix reduced to the interface space.
+    """
+    # Mass matrix on local nodes (nv_loc x nv_loc)
+    M_local = mass(vtxj, beltj_artf)
+
+    # Project to interface space: Bj @ M @ Bj.T
+    # Resulting Tj is (nbelt_art x nbelt_art)
+    Tj_interface = Bj @ M_local @ Bj.T
+
+    return k * Tj_interface
+
+
+def Sj_factorization(Aj, Tj, Bj):
+    """
+    Constructs Sj = Aj - i * (Bj.T @ Tj @ Bj) and factorizes it.
+    """
+    # Expand Tj back to local dimensions (nv_loc x nv_loc)
+    # Since Bj is real, Bj.T is sufficient for the adjoint
+    Tj_expanded = Bj.T @ Tj @ Bj
+
+    # Assemble the complex local operator
+    Sj = Aj - 1j * Tj_expanded
+
+    # Factorize (splu requires CSC format)
+    Sj_fact = spla.splu(csc_matrix(Sj))
+
+    return Sj_fact
 
 
 
@@ -121,15 +183,18 @@ if __name__ == "__main__":
     np.random.seed(1234)
     Lx = 1
     Ly = 2
-    nx = int(1 + Lx * 32)
-    ny = int(1 + Ly * 32)
+    nx = int(1 + Lx * 2)
+    ny = int(1 + Ly * 2)
 
     vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny)
     belt_phys, belt_artf = local_boundary(nx, ny, rank, size)
-    Rj = Rj_matrix(nx, ny, rank, size)
+    #Rj = Rj_matrix(nx, ny, rank, size)
+    #Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
+    #j = Cj_matrix(nx, ny, rank, size)
+    #print(f"[Rank {rank}] " f"Vertices: {belt_artf.shape[0]}, "f"tot vtx: {nx * ny}, Cj = \n{Cj.todense()}")
     belt = belt_phys
 
-    print(f"[Rank {rank}] " f"Vertices: {vtx_loc.shape[0]}, "f"Elements: {elt_loc.shape[0]}")
+    print()
 
     k = 16           # Wavenumber of the problem
     ns = 8           # Number of point sources + random position and weight below
