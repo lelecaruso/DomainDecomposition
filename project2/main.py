@@ -210,7 +210,8 @@ def bj_vector(vtxj, eltj, sp, k):
     return bj
 
 class ScatteringMatrix :
-    def __init__ (self, nx, ny, rank, size, vtx_loc, elt_loc, belt_phys, belt_artf, k):
+    def __init__ (self, nx, ny, rank, size, vtx_loc, belt_artf, k):
+        self.Aj = Aj_matrix(vtx_loc, elt_loc, belt_phys, k)
         self.Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
         self.Cj = Cj_matrix(nx, ny, rank, size)
         self.Tj = Tj_matrix(vtx_loc, belt_artf, self.Bj, k)
@@ -222,10 +223,13 @@ class ScatteringMatrix :
         I = csr_matrix( np.eye( self.Bj.shape[0] ) )  
         Sj = I + 2j * self.Bj * self.Sj_fact.solve( self.Bj.T @ self.Tj )
         return Sj @ xj
+        
 
 
 class ExchangeMatrix :
     def __init__ (self, nx, ny, rank, size):
+        self.Aj = Aj_matrix(vtx_loc, elt_loc, belt_phys, k)
+        self.Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
         self.Cj = Cj_matrix(nx, ny, rank, size)
         self.Tj = Tj_matrix(vtx_loc, belt_artf, self.Bj, k)
         self.Sj_fact = Sj_factorization(self.Aj, self.Tj, self.Bj)
@@ -239,8 +243,39 @@ class ExchangeMatrix :
         return PI @ xj
 
 
-def g_vector(Bj, Cj, bj_vector, ExMtx):
-    return -2j * ExMtx.Pi( Bj @ ExMtx.Sj_fact.solve( Cj @ bj_vector ) )
+def matvec_interface(ExMtx, SCMtx):
+    def matvec(x):
+        return x + ExMtx.Pi( SCMtx.S( ExMtx.Pi( x ) ) )
+    return matvec
+
+
+def g_vector(Bj, Cj, bj_vec, ExMtx):
+    # Compute local right-hand side
+    local_rhs = Cj @ bj_vec
+
+    # Shape checks
+    print("=== g_vector shape checks ===")
+    print("Bj.shape:", Bj.shape)
+    print("Cj.shape:", Cj.shape)
+    print("bj_vec.shape:", bj_vec.shape)
+    print("local_rhs.shape (Cj @ bj_vec):", local_rhs.shape)
+    print("Sj_fact matrix shape:", ExMtx.Sj_fact.shape)
+    
+    # Solve local problem
+    y = ExMtx.Sj_fact.solve(local_rhs)
+    print("y.shape (after solve):", y.shape)
+    
+    # Check compatibility with Bj
+    if y.shape[0] != Bj.shape[1]:
+        raise ValueError(f"Dimension mismatch: Bj.shape[1]={Bj.shape[1]}, y.shape[0]={y.shape[0]}")
+    
+    # Apply Bj and Pi
+    result = -2j * ExMtx.Pi(Bj @ y)
+    
+    # Final shape check
+    print("result.shape:", result.shape)
+    
+    return result
 
 
 if __name__ == "__main__":
@@ -252,16 +287,29 @@ if __name__ == "__main__":
 
     vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny)
     belt_phys, belt_artf = local_boundary(nx, ny, rank, size)
-    Rj = Rj_matrix(nx, ny, rank, size)
-    Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
-    Cj = Cj_matrix(nx, ny, rank, size)
     belt = belt_phys
-
-    print()
-
     k = 16           # Wavenumber of the problem
     ns = 8           # Number of point sources + random position and weight below
     sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in np.arange(ns)]
+
+    S_operator = ScatteringMatrix(nx, ny, rank, size, vtx_loc, belt_artf, k)
+    
+    Pi_operator = ExchangeMatrix(nx, ny, rank, size)
+
+    A_interface = spla.LinearOperator( ( (size-1)*nx, (size-1)*nx ),
+                                       matvec=matvec_interface(Pi_operator, S_operator), dtype=np.complex128 )
+    
+    b_interface = g_vector(S_operator.Bj, S_operator.Cj, bj_vector(vtx_loc, elt_loc, sp, k), Pi_operator)
+    
+    # Solve the interface problem with GMRES
+    residuals = [] # storage of GMRES residual history
+    def callback(x):
+        residuals.append(x)
+    x_interface, _ = spla.gmres(A_interface, b_interface, rtol=1e-12, callback=callback, callback_type='pr_norm', maxiter=200)
+    if( rank == 0 ):
+        print("Total number of GMRES iterations (interface problem) = ", len(residuals))
+
+    """
     #vtx, elt = mesh(nx, ny, Lx, Ly)
     M = mass(vtx_loc, elt_loc)
     Mb = mass(vtx_loc, belt)
@@ -277,7 +325,7 @@ if __name__ == "__main__":
     y, _ = spla.gmres(A, b, rtol=1e-12, callback=callback, callback_type='pr_norm', maxiter=200)
     print("Total number of GMRES iterations = ", len(residuals))
     print("Direct vs GMRES error            = ", la.norm(y - x))
-
+    """
     if( rank == 0 ):
         # --- Plot 1: mesh ---
         plt.figure()
