@@ -79,27 +79,62 @@ def Rj_matrix(nx, ny, j, J):
     Rj = csr_matrix((data, (rows, cols)), shape=(nv_loc, nv), dtype=np.float64)
     return Rj
 
-def Cj_matrix(nx, ny, j, J):
-    #define size of the matrix Cj which is:
-    #the sum of the size of all interfaces x size of one interface
-    # for each rank
+
+def Bj_matrix(nx, ny, j, J, belt_artf):
+    """
+    Maps the local nodes (Omega_j) to the artificial interface (Sigma_j).
+    Returns a matrix of size (nbelt_art x nv_loc).
+    """
     ny_loc = (ny - 1) // J + 1
     nv_loc = nx * ny_loc
-    sizeCrow = (J - 1) * nx
-    sizeCcol = nx if j == 0 or j == J - 1 else 2 * nx   
-    rows = np.arange(0, sizeCrow, 1, dtype=np.int64)
-    cols = np.zeros(sizeCcol, dtype=np.int64)
-    if j == J - 1:
-        cols = np.arange(0, nx, 1, dtype=np.int64)
-    elif j == 0:
-        cols = np.arange((ny_loc - 1) * nx, ny_loc * nx, 1, dtype=np.int64)
-    else:
-        cols[:nx] = np.arange(0, nx, 1, dtype=np.int64)
-        cols[nx:] = np.arange((ny_loc - 1) * nx, ny_loc * nx, 1, dtype=np.int64)
-    data = np.ones(sizeCrow, dtype=np.float64)
-    Cj = csr_matrix((data, (rows, cols)), shape=(sizeCrow, sizeCcol), dtype=np.float64)
-    return Cj
+    # Number of nodes on the artificial interface
+    # belt_artf contains pair of vertices, so we extract unique nodes
+    interface_nodes = np.unique(belt_artf)
+    nbelt_nodes = len(interface_nodes)
 
+    rows = np.arange(nbelt_nodes)  # interface index
+    cols = interface_nodes  # local node indices: the actual node numbers in the subdomain mesh
+    data = np.ones(nbelt_nodes)
+
+    # Bj: (interface_nodes x local_nodes)
+    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt_nodes, nv_loc))
+    return Bj
+
+
+def Cj_matrix(nx, ny, j, J):
+    """
+    Cj mappa i nodi dell'interfaccia locale sigma_j nel vettore globale delle interfacce.
+    Righe: Totale nodi interfacce globali ((J-1) * nx)
+    Colonne: Nodi interfaccia locale (nx oppure 2*nx)
+    """
+    ny_loc = (ny - 1) // J + 1
+    
+    # Dimensioni
+    sizeCrow = (J - 1) * nx  # Totale nodi di tutte le interfacce
+    sizeCcol = nx if (j == 0 or j == J - 1) else 2 * nx # Nodi interfaccia locale
+    
+    # Prepariamo i dati per la matrice sparsa
+    # Ogni nodo locale ha esattamente un corrispondente globale
+    data = np.ones(sizeCcol, dtype=np.float64)
+    cols = np.arange(sizeCcol, dtype=np.int64) # 0, 1, 2, ... sizeCcol-1
+    rows = np.zeros(sizeCcol, dtype=np.int64)
+    
+    if j == J - 1:
+        # Rank 0: ha solo l'interfaccia TOP. 
+        # Questa è la "Global Interface 0".
+        rows = np.arange(0, nx)
+        
+    elif j == 0:
+        # Rank J-1: ha solo l'interfaccia BOTTOM. 
+        # Questa è l'ultima interfaccia globale (indice J-2).
+        rows = np.arange((J - 2) * nx, (J - 1) * nx)
+        
+    else:
+        rows[:nx] = np.arange(nx) # Bottom
+        rows[nx:] = np.arange((ny_loc - 1) * nx, (ny_loc - 1) * nx + nx)     # Top
+    
+    Cj = csr_matrix((data, (rows, cols)), shape=(sizeCrow, sizeCcol))
+    return Cj
 
 
 def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
@@ -125,27 +160,6 @@ def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
     Aj = Kj - kappa**2 * Mj - 1j * kappa * Mbj
 
     return Aj
-
-
-def Bj_matrix(nx, ny, j, J, belt_artf):
-    """
-    Maps the local nodes (Omega_j) to the artificial interface (Sigma_j).
-    Returns a matrix of size (nbelt_art x nv_loc).
-    """
-    ny_loc = (ny - 1) // J + 1
-    nv_loc = nx * ny_loc
-    # Number of nodes on the artificial interface
-    # belt_artf contains pair of vertices, so we extract unique nodes
-    interface_nodes = np.unique(belt_artf)
-    nbelt_nodes = len(interface_nodes)
-
-    rows = np.arange(nbelt_nodes)  # interface index
-    cols = interface_nodes  # local node indices: the actual node numbers in the subdomain mesh
-    data = np.ones(nbelt_nodes)
-
-    # Bj: (interface_nodes x local_nodes)
-    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt_nodes, nv_loc))
-    return Bj
 
 
 def Tj_matrix(vtxj, beltj_artf, Bj, k):
@@ -179,6 +193,22 @@ def Sj_factorization(Aj, Tj, Bj):
     return Sj_fact
 
 
+def bj_vector(vtxj, eltj, sp, k):
+    """
+    Constructs the local right-hand side vector due to point sources.
+    """
+    # Number of local vertices
+    nv_loc = vtxj.shape[0]
+
+    # Initialize local RHS vector
+    bj = np.zeros(nv_loc, dtype=np.complex128)
+    Mj = mass(vtxj, eltj)
+    # Evaluate point sources at local vertices
+    bj = Mj @ point_source(sp,k)(vtxj) # linear system RHS (source term)
+
+
+    return bj
+
 
 
 if __name__ == "__main__":
@@ -190,10 +220,9 @@ if __name__ == "__main__":
 
     vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny)
     belt_phys, belt_artf = local_boundary(nx, ny, rank, size)
-    #Rj = Rj_matrix(nx, ny, rank, size)
-    #Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
+    Rj = Rj_matrix(nx, ny, rank, size)
+    Bj = Bj_matrix(nx, ny, rank, size, belt_artf)
     Cj = Cj_matrix(nx, ny, rank, size)
-    print(f"[Rank {rank}] " f"Vertices: {belt_artf.shape[0]}, "f"tot vtx: {nx * ny}, Bj = \n{Cj.todense()}")
     belt = belt_phys
 
     print()
@@ -207,6 +236,11 @@ if __name__ == "__main__":
     K = stiffness(vtx_loc, elt_loc)
     A = K - k**2 * M - 1j*k*Mb      # matrix of linear system 
     b = M @ point_source(sp,k)(vtx_loc) # linear system RHS (source term)
+    if rank == 0:
+        print("bj constructed = \n", Rj.T @ b)
+        bj = bj_vector(vtx_loc, elt_loc, sp, k)
+        print("bj_vector     = \n", bj)
+        print("Difference    = ", la.norm(Rj.T @ b - bj @ Rj))
     x = spla.spsolve(A, b)          # solution of linear system via direct solver
 
     # GMRES
