@@ -13,8 +13,8 @@ from utils import mesh, mass, stiffness, plot_mesh, point_source, boundary
 #Global Variables
 na = np.newaxis
 comm = MPI.COMM_WORLD
-j = comm.Get_rank()
-J = comm.Get_size()
+rank = comm.Get_rank()
+size = comm.Get_size()
 
 def local_mesh(Lx, Ly, nx, ny, j, J):
     # Get MPI parameters
@@ -213,38 +213,37 @@ def bj_vector(vtxj, eltj, sp, k):
     return bj
 
 
-def g_vector(nx, ny, J, Bj, Cj, bj, Sj_fact):
+def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
     # Initialize global interface vector
     g_size = (J - 1) * nx * 2
     g = np.zeros(g_size, dtype=np.complex128)
     # Loop over all subdomains
-    y_j = Sj_fact.solve(bj)
-    # Extract interface values using B_j
-    y_j_interface = Bj @ y_j
-    # C_j maps local interface to global interface
-    local_contribution =  Cj.T @ y_j_interface
-    # This exchanges information between subdomains
-    Pi = Pi_operator(nx, J)
-    exchanged = Pi @ local_contribution
-    local_contrib = -2j * exchanged
-
-    comm.Allreduce(local_contrib,g,op=MPI.SUM)
-
+    for j in range(J):
+        y_j = Sj_fact_list[j].solve(bj_list[j])
+        # Extract interface values using B_j
+        y_j_interface = Bj_list[j] @ y_j
+        # C_j maps local interface to global interface
+        local_contribution =  Cj_list[j].T @ y_j_interface
+        # This exchanges information between subdomains
+        Pi = Pi_operator(nx, J)
+        exchanged = Pi @ local_contribution
+        g += -2j * exchanged
+        
     return g
 
 
-def S_operator( nx, ny, J, Bj, Tj, Cj, Sj_fact):
+def S_operator( nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
-
     def matvec(x):
         result = np.zeros_like(x, dtype=np.complex128)
-        x_local_interface = Cj @ x
-        x_local_full = Bj.T @ Tj @ x_local_interface
-        y = Sj_fact.solve(x_local_full)
-        y_interface = x_local_interface + 2j * Bj @ y
-        local_contrib = Cj.T @ y_interface
-        
-        comm.Allreduce(local_contrib,result,op=MPI.SUM)
+
+        for j in range(J):
+            x_local_interface = Cj_list[j] @ x
+            x_local_full = Bj_list[j].T @ Tj_list[j] @ x_local_interface
+
+            y = Sj_fact_list[j].solve(x_local_full)
+            y_interface = x_local_interface + 2j * Bj_list[j] @ y
+            result += Cj_list[j].T @ y_interface
         
         return result
 
@@ -252,31 +251,32 @@ def S_operator( nx, ny, J, Bj, Tj, Cj, Sj_fact):
 
 
 def Pi_operator(nx, J):
-    vector_size = 2 * nx * (J - 1)
+    vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
 
     def matvec(x):
         result = np.zeros_like(x)
 
-        # local interface index
-        interface_idx = j
+        for interface_idx in range(J - 1):
+            # Each interface has 2*nx values (nx from each side)
+            idx1_start = 2 * interface_idx * nx
+            idx1_end = idx1_start + nx
+            idx2_start = idx1_end
+            idx2_end = idx2_start + nx
 
-        i0 = 2 * interface_idx * nx
-        i1 = i0 + nx
-        i2 = i1 + nx
-
-        result[i0:i1] = x[i1:i2]
-        result[i1:i2] = x[i0:i1]
+            # Swap the two halves
+            result[idx1_start:idx1_end] = x[idx2_start:idx2_end]
+            result[idx2_start:idx2_end] = x[idx1_start:idx1_end]
 
         return result
 
-    return spla.LinearOperator( (vector_size, vector_size),matvec=matvec)
+    return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
 
 
-def interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact):
+def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
 
     vector_size = 2 * nx * (J - 1)
 
-    S = S_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact)
+    S = S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list)
     Pi = Pi_operator(nx, J)
 
     def matvec(x):
@@ -289,10 +289,10 @@ def interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact):
     )
 
 
-def uj_solution(Sj_fact, Bj, Cj, Tj, bj, sol, J ):
+def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J ):
     sols = None
     for j in range(J):
-        x = Sj_fact.solve( Bj.T @ Tj @ ( Cj @ sol ) +  bj )
+        x = Sj_fact_list[j].solve( Bj_list[j].T @ Tj_list[j] @ ( Cj_list[j] @ sol ) +  bj_list[j] )
         if sols is None:
             sols = x
         else:
@@ -300,7 +300,7 @@ def uj_solution(Sj_fact, Bj, Cj, Tj, bj, sol, J ):
     return sols
 
 
-def parallel_fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
+def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
     sol = starting
     residuals = []
     res = tol+1
@@ -339,41 +339,79 @@ if __name__ == "__main__":
     Ly = 2
     nx = int(1 + Lx * 32)
     ny = int(1 + Ly * 32)
-
+    j = 2
+    J = 4
     k = 16
     ns = 8
     sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in np.arange(ns)]
     
-    vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
-    belt_phys, belt_art = local_boundary(nx, ny, j, J)
-    M = mass(vtx_loc, elt_loc)
-    Mb = mass(vtx_loc, belt_phys)
-    K = stiffness(vtx_loc, elt_loc)
-    Aj = K - k**2 * M - 1j*k*Mb
-    Bj = Bj_matrix(nx, ny, j, J, belt_art)
-    Cj = Cj_matrix(nx, ny, j, J)
-    Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
-    Sj_fact = Sj_factorization(Aj, Tj, Bj)
-    bj = bj_vector(vtx_loc, elt_loc, sp, k)
-
+    Bj_list = []
+    Cj_list = []
+    Tj_list = []
+    Sj_fact_list = []
+    bj_list = []  
+    Rj_list = []
     
-    g = g_vector(nx, ny, J, Bj, Cj, bj, Sj_fact)
-    I_PIS = interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact)
+    for j in range(J):
+        vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
+        belt_phys, belt_art = local_boundary(nx, ny, j, J)
+        M = mass(vtx_loc, elt_loc)
+        Mb = mass(vtx_loc, belt_phys)
+        K = stiffness(vtx_loc, elt_loc)
+        Aj = K - k**2 * M - 1j*k*Mb
+        Bj = Bj_matrix(nx, ny, j, J, belt_art)
+        Cj = Cj_matrix(nx, ny, j, J)
+        Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
+        Sj = Sj_factorization(Aj, Tj, Bj)
+        
+        bj = bj_vector(vtx_loc, elt_loc, sp, k)
+        
+        Bj_list.append(Bj)
+        Cj_list.append(Cj)
+        Tj_list.append(Tj)
+        Sj_fact_list.append(Sj)
+        bj_list.append(bj)  
+    
+    g = g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list)
+    I_PIS = interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list)
 
   
+    residuals_gmres = []
     residuals_fp = []
 
+    #GMRES
+    def callback(x):
+        residuals_gmres.append(x)
+
+    t0 = time.perf_counter()
+    interf_sol_gmres, _ = spla.gmres(I_PIS, g, atol=1e-8, restart=50, maxiter=500,callback=callback, callback_type='pr_norm')
+    tgmrs = time.perf_counter() - t0
+
+    uu_gmres = uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list,bj_list, interf_sol_gmres, J )
+    u_gmres = u_global(uu_gmres)
 
     #FIXED POINT
     starting_sol = np.zeros( interf_sol_gmres.shape[0] )
     
     t0 = time.perf_counter()
-    interf_sol_fp , residuals_fp = parallel_fixed_point(0.5, starting_sol, g, I_PIS)
+    interf_sol_fp , residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
     tfp =  time.perf_counter() - t0
 
-    uu_fp = uj_solution(Sj_fact, Bj, Cj, Tj,bj, interf_sol_fp, J )
+    uu_fp = uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list,bj_list, interf_sol_fp, J )
     u_fp = u_global(uu_fp)
 
+    #error between solvers
+    print("Gmres vs Fp RELATIVE ERROR NORM = " ,  np.linalg.norm( u_gmres - u_fp ) / np.linalg.norm( u_gmres ))
+    print(f"Elapsed time: \ngmres -> { tgmrs*1000 } ms \nfp ----> { tfp*1000 } ms  \n")
+
+    #plot both residuals
+    plt.figure()
+    plt.semilogy(residuals_gmres)
+    plt.xlabel("Iteration")
+    plt.ylabel("Residual")
+    plt.grid(True, which="both")
+    plt.savefig("residualsGMRES.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
     plt.figure()
     plt.semilogy(residuals_fp)
