@@ -315,48 +315,87 @@ if __name__ == "__main__":
     Sj_fact = Sj_factorization(Aj, Tj, Bj)
     bj = bj_vector(vtx_loc, elt_loc, sp, k)
 
-    #  Construct Global/Parallel Operators
+    # 2. Construct Global/Parallel Operators
     g = g_vector(nx, ny, J, Bj, Cj, bj, Sj_fact)
-
     I_PIS = interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact)
 
-    # Solver (Fixed Point)
     global_interface_size = 2 * nx * (J - 1)
     starting_sol = np.zeros(global_interface_size, dtype=np.complex128)
 
+    # ---------------------------------------------------------
+    # Solver: Fixed Point
+    # ---------------------------------------------------------
     comm.Barrier()
-    t0 = time.perf_counter()
+    t0_fp = time.perf_counter()
 
+    # Run Fixed Point
     interf_sol_fp, residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
 
     comm.Barrier()
-    tfp = time.perf_counter() - t0
+    tfp = time.perf_counter() - t0_fp
 
-    # 4. Recover Local Solution
-    u_local = uj_solution(Sj_fact, Bj, Cj, Tj, bj, interf_sol_fp, J)
+    # ---------------------------------------------------------
+    # Solver: GMRES
+    # ---------------------------------------------------------
+    # Prepare callback to store residuals for plotting
+    res_gmres = []
 
-    # 5. Gather and Plot (Rank 0 only)
+    def gmres_callback(rk):
+        res_gmres.append(rk)
+
+    comm.Barrier()
+    t0_gmres = time.perf_counter()
+
+    # Solve using scipy GMRES with the LinearOperator
+    # restart=30 is standard; maxiter is the max number of restarts * restart size
+    sol_gmres, info = spla.gmres(
+        I_PIS,
+        g,
+        x0=starting_sol,
+        rtol=1e-8,
+        atol=0,
+        restart=30,
+        maxiter=500,
+        callback=gmres_callback,
+    )
+    comm.Barrier()
+    t_gmres = time.perf_counter() - t0_gmres
+
+    # ---------------------------------------------------------
+    # Recover Local Solution (Using GMRES result)
+    # ---------------------------------------------------------
+
+    u_local = uj_solution(Sj_fact, Bj, Cj, Tj, bj, sol_gmres, J)
+
+    # Gather Global Solution
     u_final = u_global_gather(nx, ny, J, u_local, rank)
 
     if rank == 0:
-        print(f"Parallel Fixed Point Converged in {len(residuals_fp)} iterations.")
-        print(f"Elapsed time (MPI size {J}): {tfp*1000:.2f} ms")
+        print(f"--- Results (MPI Size {J}) ---")
+        print(f"Fixed Point: {len(residuals_fp)} iterations, {tfp:.4f} s")
+        print(
+            f"GMRES:       {len(res_gmres)} iterations, {t_gmres:.4f} s (Info: {info})"
+        )
 
-        # Plot Residuals
+        # Plot Residuals Comparison
         plt.figure()
-        plt.semilogy(residuals_fp)
+        plt.semilogy(residuals_fp, label="Fixed Point ($\\omega=0.5$)")
+        plt.semilogy(res_gmres, label="GMRES")
         plt.xlabel("Iteration")
-        plt.ylabel("Residual")
-        plt.grid(True, which="both")
-        plt.title(f"Parallel FP Residuals (J={J})")
-        plt.savefig("residualsFP_MPI.png", dpi=300, bbox_inches="tight")
+        plt.ylabel("Residual Norm (Relative)")
+        plt.grid(True, which="both", linestyle="--")
+        plt.legend()
+        plt.title(f"Convergence Comparison (J={J})")
+        plt.savefig("comparison_residuals.png", dpi=300, bbox_inches="tight")
         plt.close()
+        print("Saved convergence plot to 'comparison_residuals.png'")
 
         # Plot Solution Real Part
         vtx_global, elt_global = mesh(nx, ny, Lx, Ly)
         plt.figure()
         plot_mesh(vtx_global, elt_global, np.real(u_final))
         plt.colorbar()
-        plt.title("Global Solution (Real Part)")
+        plt.title(f"Global Solution Real Part (GMRES, J={J})")
         plt.savefig("solution_real_MPI.png", dpi=300, bbox_inches="tight")
         plt.close()
+        print("Saved solution plot to 'solution_real_MPI.png'")
