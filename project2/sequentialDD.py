@@ -10,16 +10,17 @@ import matplotlib.tri as mtri
 from mpi4py import MPI
 from utils import mesh, mass, stiffness, plot_mesh, point_source, boundary
 
-#Global Variables
+# Global Variables
 na = np.newaxis
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
+
 def local_mesh(Lx, Ly, nx, ny, j, J):
     # Get MPI parameters
-    #J = size
-    #j = rank
+    # J = size
+    # j = rank
     # Number of points per subdomain in y (with interface sharing)
     ny_loc = (ny - 1) // J + 1
     # Local vertical size
@@ -35,7 +36,7 @@ def local_boundary(nx, ny, j, J):
     ny_loc = (ny - 1) // J + 1
     phys = []
     artf = []
-    # Bottom boundary 
+    # Bottom boundary
     # important to notice that only the first subdomain has physical bottom boundary
     for i in range(nx - 1):
         edge = [i, i + 1]
@@ -56,8 +57,7 @@ def local_boundary(nx, ny, j, J):
     for k in range(ny_loc - 1):
         phys.append([k * nx, (k + 1) * nx])
     for k in range(ny_loc - 1):
-        phys.append([k * nx + nx - 1,
-                     (k + 1) * nx + nx - 1])
+        phys.append([k * nx + nx - 1, (k + 1) * nx + nx - 1])
     return np.array(phys, dtype=int), np.array(artf, dtype=int)
 
 
@@ -108,8 +108,8 @@ def Cj_matrix(nx, ny_glob, j, J):
     global_size = 2 * nx * (J - 1)
 
     # Figure out which interfaces this subdomain has
-    has_bottom_interface = (j > 0)
-    has_top_interface = (j < J - 1)
+    has_bottom_interface = j > 0
+    has_top_interface = j < J - 1
 
     num_local_interfaces = has_bottom_interface + has_top_interface
     local_size = num_local_interfaces * nx
@@ -207,8 +207,7 @@ def bj_vector(vtxj, eltj, sp, k):
     bj = np.zeros(nv_loc, dtype=np.complex128)
     Mj = mass(vtxj, eltj)
     # Evaluate point sources at local vertices
-    bj = Mj @ point_source(sp,k)(vtxj) # linear system RHS (source term)
-
+    bj = Mj @ point_source(sp, k)(vtxj)  # linear system RHS (source term)
 
     return bj
 
@@ -223,17 +222,18 @@ def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
         # Extract interface values using B_j
         y_j_interface = Bj_list[j] @ y_j
         # C_j maps local interface to global interface
-        local_contribution =  Cj_list[j].T @ y_j_interface
+        local_contribution = Cj_list[j].T @ y_j_interface
         # This exchanges information between subdomains
         Pi = Pi_operator(nx, J)
         exchanged = Pi @ local_contribution
         g += -2j * exchanged
-        
+
     return g
 
 
-def S_operator( nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
+def S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
+
     def matvec(x):
         result = np.zeros_like(x, dtype=np.complex128)
 
@@ -244,7 +244,7 @@ def S_operator( nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
             y = Sj_fact_list[j].solve(x_local_full)
             y_interface = x_local_interface + 2j * Bj_list[j] @ y
             result += Cj_list[j].T @ y_interface
-        
+
         return result
 
     return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
@@ -283,30 +283,30 @@ def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
         return x + Pi.matvec(S.matvec(x))
 
     return spla.LinearOperator(
-        (vector_size, vector_size),
-        matvec=matvec,
-        dtype=np.complex128
+        (vector_size, vector_size), matvec=matvec, dtype=np.complex128
     )
 
 
-def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J ):
+def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J):
     sols = None
     for j in range(J):
-        x = Sj_fact_list[j].solve( Bj_list[j].T @ Tj_list[j] @ ( Cj_list[j] @ sol ) +  bj_list[j] )
+        x = Sj_fact_list[j].solve(
+            Bj_list[j].T @ Tj_list[j] @ (Cj_list[j] @ sol) + bj_list[j]
+        )
         if sols is None:
             sols = x
         else:
-            sols = np.hstack((sols,x))
+            sols = np.hstack((sols, x))
     return sols
 
 
 def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
     sol = starting
     residuals = []
-    res = tol+1
+    res = tol + 1
     it = 0
     while res > tol and it < maxit:
-        diff = (g_vector - I_PIS.matvec(sol))
+        diff = g_vector - I_PIS.matvec(sol)
         sol = sol + w * diff
         res = np.linalg.norm(diff)
         residuals.append(res)
@@ -316,10 +316,10 @@ def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
 
 
 def u_global(uu_gmres):
-    #build the pseudoinverse to compute global u 
+    # build the pseudoinverse to compute global u
     R = None
     for j in range(J):
-        Rj = Rj_matrix(nx,ny,j,J)
+        Rj = Rj_matrix(nx, ny, j, J)
         if R is None:
             R = Rj.T
         else:
@@ -337,74 +337,88 @@ if __name__ == "__main__":
     np.random.seed(1234)
     Lx = 1
     Ly = 2
-    nx = int(1 + Lx * 32)
-    ny = int(1 + Ly * 32)
+    nx = int(1 + Lx * 64)
+    ny = int(1 + Ly * 64)
     j = 2
     J = 4
     k = 16
     ns = 8
     sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in np.arange(ns)]
-    
+
     Bj_list = []
     Cj_list = []
     Tj_list = []
     Sj_fact_list = []
-    bj_list = []  
+    bj_list = []
     Rj_list = []
-    
+
     for j in range(J):
         vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
         belt_phys, belt_art = local_boundary(nx, ny, j, J)
         M = mass(vtx_loc, elt_loc)
         Mb = mass(vtx_loc, belt_phys)
         K = stiffness(vtx_loc, elt_loc)
-        Aj = K - k**2 * M - 1j*k*Mb
+        Aj = K - k**2 * M - 1j * k * Mb
         Bj = Bj_matrix(nx, ny, j, J, belt_art)
         Cj = Cj_matrix(nx, ny, j, J)
         Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
         Sj = Sj_factorization(Aj, Tj, Bj)
-        
+
         bj = bj_vector(vtx_loc, elt_loc, sp, k)
-        
+
         Bj_list.append(Bj)
         Cj_list.append(Cj)
         Tj_list.append(Tj)
         Sj_fact_list.append(Sj)
-        bj_list.append(bj)  
-    
+        bj_list.append(bj)
+
     g = g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list)
     I_PIS = interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list)
 
-  
     residuals_gmres = []
     residuals_fp = []
 
-    #GMRES
+    # GMRES
     def callback(x):
         residuals_gmres.append(x)
 
     t0 = time.perf_counter()
-    interf_sol_gmres, _ = spla.gmres(I_PIS, g, atol=1e-8, restart=50, maxiter=500,callback=callback, callback_type='pr_norm')
+    interf_sol_gmres, _ = spla.gmres(
+        I_PIS,
+        g,
+        atol=1e-8,
+        restart=50,
+        maxiter=500,
+        callback=callback,
+        callback_type="pr_norm",
+    )
     tgmrs = time.perf_counter() - t0
 
-    uu_gmres = uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list,bj_list, interf_sol_gmres, J )
+    uu_gmres = uj_solution(
+        Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, interf_sol_gmres, J
+    )
     u_gmres = u_global(uu_gmres)
 
-    #FIXED POINT
-    starting_sol = np.zeros( interf_sol_gmres.shape[0] )
-    
-    t0 = time.perf_counter()
-    interf_sol_fp , residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
-    tfp =  time.perf_counter() - t0
+    # FIXED POINT
+    starting_sol = np.zeros(interf_sol_gmres.shape[0])
 
-    uu_fp = uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list,bj_list, interf_sol_fp, J )
+    t0 = time.perf_counter()
+    interf_sol_fp, residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
+    tfp = time.perf_counter() - t0
+
+    uu_fp = uj_solution(
+        Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, interf_sol_fp, J
+    )
     u_fp = u_global(uu_fp)
 
-    #error between solvers
-    print("Gmres vs Fp RELATIVE ERROR NORM = " ,  np.linalg.norm( u_gmres - u_fp ) / np.linalg.norm( u_gmres ))
+    # error between solvers
+    print(
+        "Gmres vs Fp RELATIVE ERROR NORM = ",
+        np.linalg.norm(u_gmres - u_fp) / np.linalg.norm(u_gmres),
+    )
     print(f"Elapsed time: \ngmres -> { tgmrs*1000 } ms \nfp ----> { tfp*1000 } ms  \n")
 
-    #plot both residuals
+    # plot both residuals
     plt.figure()
     plt.semilogy(residuals_gmres)
     plt.xlabel("Iteration")
@@ -420,10 +434,8 @@ if __name__ == "__main__":
     plt.grid(True, which="both")
     plt.savefig("residualsFP.png", dpi=300, bbox_inches="tight")
     plt.close()
-    
-            
-        
-        
+
+
 """
         # --- Plot 1: mesh ---
         plt.figure()
