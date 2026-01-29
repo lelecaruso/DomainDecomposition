@@ -8,98 +8,9 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from mpi4py import MPI
-from utils import mesh, mass, stiffness, plot_mesh, point_source, boundary
+from code import mesh, mass, stiffness, plot_mesh, point_source, boundary
+from local import local_mesh, local_boundary, Bj_matrix, Tj_matrix, Sj_factorization, Rj_matrix, bj_vector
 
-# Global Variables
-na = np.newaxis
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
-
-
-def local_mesh(Lx, Ly, nx, ny, j, J):
-    # Get MPI parameters
-    # J = size
-    # j = rank
-    # Number of points per subdomain in y (with interface sharing)
-    ny_loc = (ny - 1) // J + 1
-    # Local vertical size
-    Ly_loc = Ly / J
-    # Build local mesh
-    vtx_loc, elt_loc = mesh(nx, ny_loc, Lx, Ly_loc)
-    # Shift to global y-position
-    vtx_loc[:, 1] += j * Ly_loc
-    return vtx_loc, elt_loc
-
-
-def local_boundary(nx, ny, j, J):
-    ny_loc = (ny - 1) // J + 1
-    phys = []
-    artf = []
-    # Bottom boundary
-    # important to notice that only the first subdomain has physical bottom boundary
-    for i in range(nx - 1):
-        edge = [i, i + 1]
-        if j == 0:
-            phys.append(edge)
-        else:
-            artf.append(edge)
-    # Top boundary
-    # important to notice that only the last subdomain has physical top boundary
-    offset = (ny_loc - 1) * nx
-    for i in range(nx - 1):
-        edge = [offset + i, offset + i + 1]
-        if j == J - 1:
-            phys.append(edge)
-        else:
-            artf.append(edge)
-    # Left-Right boundary (always physical)
-    for k in range(ny_loc - 1):
-        phys.append([k * nx, (k + 1) * nx])
-    for k in range(ny_loc - 1):
-        phys.append([k * nx + nx - 1, (k + 1) * nx + nx - 1])
-    return np.array(phys, dtype=int), np.array(artf, dtype=int)
-
-
-def Rj_matrix(nx, ny_glob, j, J):
-    assert j < J
-    assert (ny_glob - 1) % J == 0
-    ny = ny_glob // J + 1
-
-    first_vertex_in_omega_j = nx * (ny - 1) * j
-    tot_vertex_in_omega_j = nx * ny
-
-    Rj = np.zeros((tot_vertex_in_omega_j, nx * ny_glob))
-
-    row = 0
-    col = first_vertex_in_omega_j
-    while row < Rj.shape[0]:
-        Rj[row, col] = 1
-        col += 1
-        row += 1
-
-    return Rj
-
-
-def Bj_matrix(nx, ny, j, J, belt_artf):
-    """
-    Maps the local nodes (Omega_j) to the artificial interface (Sigma_j).
-    Returns a matrix of size (nbelt_art x nv_loc).
-    """
-    ny_loc = (ny - 1) // J + 1
-    nv_loc = nx * ny_loc
-    # Number of nodes on the artificial interface
-    # belt_artf contains pair of vertices, so we extract unique nodes
-    interface_nodes = np.unique(belt_artf)
-    nbelt_nodes = len(interface_nodes)
-
-    rows = np.arange(nbelt_nodes)  # interface index
-    cols = interface_nodes  # local node indices: the actual node numbers in the subdomain mesh
-    data = np.ones(nbelt_nodes)
-
-    # Bj: (interface_nodes x local_nodes)
-    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt_nodes, nv_loc))
-    return Bj
 
 
 def Cj_matrix(nx, ny_glob, j, J):
@@ -146,72 +57,6 @@ def Cj_matrix(nx, ny_glob, j, J):
 
     return Cj
 
-
-def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
-    """
-    given the global assembly of A matrix:
-    M = mass(vtx_loc, elt_loc)
-    Mb = mass(vtx_loc, belt)
-    K = stiffness(vtx_loc, elt_loc)
-    A = K - k**2 * M - 1j * k * Mb  # matrix of linear system
-    """
-    #  Compute the local stiffness matrix
-    Kj = stiffness(vtxj, eltj)
-
-    # Compute the local mass matrix
-    Mj = mass(vtxj, eltj)
-
-    # 3. Compute the local boundary mass matrix for physical boundaries
-    # This represents the Robin/absorbing boundary condition (impedance)
-    Mbj = mass(vtxj, beltj_phys)
-
-    # 4. Assemble the local operator: A = K - k^2 * M - i * k * Mb
-    # Note: We use 1j for the imaginary unit
-    Aj = Kj - kappa**2 * Mj - 1j * kappa * Mbj
-
-    return Aj
-
-
-def Tj_matrix(vtxj, beltj_artf, Bj, k):
-
-    # Mass matrix on local nodes (nv_loc x nv_loc)
-    M_local = mass(vtxj, beltj_artf)
-
-    # Project to interface space: Bj @ M @ Bj.T
-    # Resulting Tj is (nbelt_art x nbelt_art)
-    Tj_interface = Bj @ M_local @ Bj.T
-
-    return k * Tj_interface
-
-
-def Sj_factorization(Aj, Tj, Bj):
-    # Expand Tj back to local dimensions (nv_loc x nv_loc)
-    # Since Bj is real, Bj.T is sufficient for the adjoint
-    Tj_expanded = Bj.T @ Tj @ Bj
-
-    # Assemble the complex local operator
-    Sj = Aj - 1j * Tj_expanded
-
-    # Factorize (splu requires CSC format)
-    Sj_fact = spla.splu(csc_matrix(Sj))
-
-    return Sj_fact
-
-
-def bj_vector(vtxj, eltj, sp, k):
-
-    # Number of local vertices
-    nv_loc = vtxj.shape[0]
-
-    # Initialize local RHS vector
-    bj = np.zeros(nv_loc, dtype=np.complex128)
-    Mj = mass(vtxj, eltj)
-    # Evaluate point sources at local vertices
-    bj = Mj @ point_source(sp, k)(vtxj)  # linear system RHS (source term)
-
-    return bj
-
-
 def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
     # Initialize global interface vector
     g_size = (J - 1) * nx * 2
@@ -230,7 +75,6 @@ def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
 
     return g
 
-
 def S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
 
@@ -248,7 +92,6 @@ def S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
         return result
 
     return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
-
 
 def Pi_operator(nx, J):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
@@ -271,7 +114,6 @@ def Pi_operator(nx, J):
 
     return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
 
-
 def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
 
     vector_size = 2 * nx * (J - 1)
@@ -286,7 +128,6 @@ def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
         (vector_size, vector_size), matvec=matvec, dtype=np.complex128
     )
 
-
 def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J):
     sols = None
     for j in range(J):
@@ -298,7 +139,6 @@ def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J):
         else:
             sols = np.hstack((sols, x))
     return sols
-
 
 def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
     sol = starting
@@ -313,7 +153,6 @@ def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
         it += 1
 
     return sol, residuals
-
 
 def u_global(uu_gmres):
     # build the pseudoinverse to compute global u
@@ -331,6 +170,9 @@ def u_global(uu_gmres):
     u = Ru / d
 
     return u
+
+
+
 
 
 if __name__ == "__main__":
@@ -424,7 +266,7 @@ if __name__ == "__main__":
     plt.xlabel("Iteration")
     plt.ylabel("Residual")
     plt.grid(True, which="both")
-    plt.savefig("residualsGMRES.png", dpi=300, bbox_inches="tight")
+    plt.savefig("../plots/seq_res_gmres.png", dpi=300, bbox_inches="tight")
     plt.close()
 
     plt.figure()
@@ -432,7 +274,21 @@ if __name__ == "__main__":
     plt.xlabel("Iteration")
     plt.ylabel("Residual")
     plt.grid(True, which="both")
-    plt.savefig("residualsFP.png", dpi=300, bbox_inches="tight")
+    plt.savefig("../plots/seq_res_fp.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    vtx, elt = mesh(nx,ny,Lx,Ly)
+
+    plt.figure()
+    plot_mesh(vtx, elt, np.real(u_fp))
+    plt.colorbar()
+    plt.savefig("../plots/seq_sol_real_fp.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    plt.figure()
+    plot_mesh(vtx, elt, np.abs(u_fp))
+    plt.colorbar()
+    plt.savefig("../plots/seq_sol_abs_fp.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 

@@ -8,7 +8,8 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from mpi4py import MPI
-from utils import mesh, mass, stiffness, plot_mesh, point_source, boundary
+from code import mesh, mass, stiffness, plot_mesh, point_source, boundary
+from local import local_mesh, local_boundary, Bj_matrix, Tj_matrix, Sj_factorization, Rj_matrix, bj_vector
 
 # --- MPI Setup ---
 comm = MPI.COMM_WORLD
@@ -17,385 +18,139 @@ size = comm.Get_size()
 j = rank  # Subdomain index
 J = size  # Total subdomains
 
+def Pi_local(v_local, nx, rank, size):
+    v_exchanged = np.zeros_like(v_local)
 
-def local_mesh(Lx, Ly, nx, ny, j, J):
-    # Number of points per subdomain in y (with interface sharing)
-    ny_loc = (ny - 1) // J + 1
-    # Local vertical size
-    Ly_loc = Ly / J
-    # Build local mesh
-    vtx_loc, elt_loc = mesh(nx, ny_loc, Lx, Ly_loc)
-    # Shift to global y-position
-    vtx_loc[:, 1] += j * Ly_loc
-    return vtx_loc, elt_loc
+    #bottom swap (with rank-1)
+    if rank > 0:
+        # My bottom interface is at index [0:nx]
+        bottom = v_local[0:nx]
+        neighbor_below = rank - 1
+        recv_buffer = np.zeros(nx, dtype=np.complex128)
 
+        # Tags: 1 for Top->Bottom, 2 for Bottom->Top
+        comm.Sendrecv(
+            sendbuf=bottom,dest=neighbor_below,sendtag=1,
+            recvbuf=recv_buffer, source=neighbor_below, recvtag=2,)
+        v_exchanged[0:nx] = recv_buffer
 
-def local_boundary(nx, ny, j, J):
-    ny_loc = (ny - 1) // J + 1
-    phys = []
-    artf = []
-    # Bottom boundary
-    for i in range(nx - 1):
-        edge = [i, i + 1]
-        if j == 0:
-            phys.append(edge)
-        else:
-            artf.append(edge)
-    # Top boundary
-    offset = (ny_loc - 1) * nx
-    for i in range(nx - 1):
-        edge = [offset + i, offset + i + 1]
-        if j == J - 1:
-            phys.append(edge)
-        else:
-            artf.append(edge)
-    # Left-Right boundary (always physical)
-    for k in range(ny_loc - 1):
-        phys.append([k * nx, (k + 1) * nx])
-    for k in range(ny_loc - 1):
-        phys.append([k * nx + nx - 1, (k + 1) * nx + nx - 1])
-    return np.array(phys, dtype=int), np.array(artf, dtype=int)
+    #top swap (with rank+1)
+    if rank < size - 1:
+        # If I have a bottom, my top starts at nx. If I'm Rank 0, it starts at 0.
+        start_idx = nx if rank > 0 else 0
+        top = v_local[start_idx : start_idx + nx]
+        neighbor_above = rank + 1
+        recv_buffer = np.zeros(nx, dtype=np.complex128)
 
+        comm.Sendrecv(
+            sendbuf=top,dest=neighbor_above,sendtag=2,
+            recvbuf=recv_buffer,source=neighbor_above,recvtag=1,)
+        v_exchanged[start_idx : start_idx + nx] = recv_buffer
 
-def Rj_matrix(nx, ny_glob, j, J):
-    assert j < J
-    assert (ny_glob - 1) % J == 0
-    ny = ny_glob // J + 1
-    first_vertex_in_omega_j = nx * (ny - 1) * j
-    tot_vertex_in_omega_j = nx * ny
-    Rj = np.zeros((tot_vertex_in_omega_j, nx * ny_glob))
-    row = 0
-    col = first_vertex_in_omega_j
-    while row < Rj.shape[0]:
-        Rj[row, col] = 1
-        col += 1
-        row += 1
-    return Rj
+    return v_exchanged
 
+def S_local(v_local, Bj, Tj, Sj_fact):
+    # Operator S = I + 2j * Bj * Sj^-1 * Bj.T * Tj
+    w_vol = Bj.T @ (Tj @ v_local)
+    y_vol = Sj_fact.solve(w_vol)
+    return v_local + 2j * (Bj @ y_vol)
 
-def Bj_matrix(nx, ny, j, J, belt_artf):
-    ny_loc = (ny - 1) // J + 1
-    nv_loc = nx * ny_loc
-    interface_nodes = np.unique(belt_artf)
-    nbelt_nodes = len(interface_nodes)
-    rows = np.arange(nbelt_nodes)
-    cols = interface_nodes
-    data = np.ones(nbelt_nodes)
-    Bj = csr_matrix((data, (rows, cols)), shape=(nbelt_nodes, nv_loc))
-    return Bj
+def uj_solution(Sj_fact, bj, Bj, Tj, sol_int):
+    return  Sj_fact.solve(bj + Bj.T @ (Tj @ sol_int))
 
+def g_vector_local(yj_interf, nx, rank, size):
+    return -2j * Pi_local(yj_interf, nx, rank, size)
 
-def Cj_matrix(nx, ny_glob, j, J):
-    # Maps local interface vector to the Global Interface Vector
-    assert 0 <= j < J
-    global_size = 2 * nx * (J - 1)
-    has_bottom_interface = j > 0
-    has_top_interface = j < J - 1
-    num_local_interfaces = has_bottom_interface + has_top_interface
-    local_size = num_local_interfaces * nx
-    Cj = np.zeros((local_size, global_size))
-    local_offset = 0
-
-    if has_bottom_interface:
-        interface_number = j - 1
-        # View from above (second block of the interface)
-        global_start = 2 * interface_number * nx + nx
-        for i in range(nx):
-            Cj[local_offset + i, global_start + i] = 1
-        local_offset += nx
-
-    if has_top_interface:
-        interface_number = j
-        # View from below (first block of the interface)
-        global_start = 2 * interface_number * nx
-        for i in range(nx):
-            Cj[local_offset + i, global_start + i] = 1
-        local_offset += nx
-    return Cj
-
-
-def Aj_matrix(vtxj, eltj, beltj_phys, kappa):
-    Kj = stiffness(vtxj, eltj)
-    Mj = mass(vtxj, eltj)
-    Mbj = mass(vtxj, beltj_phys)
-    Aj = Kj - kappa**2 * Mj - 1j * kappa * Mbj
-    return Aj
-
-
-def Tj_matrix(vtxj, beltj_artf, Bj, k):
-    M_local = mass(vtxj, beltj_artf)
-    Tj_interface = Bj @ M_local @ Bj.T
-    return k * Tj_interface
-
-
-def Sj_factorization(Aj, Tj, Bj):
-    Tj_expanded = Bj.T @ Tj @ Bj
-    Sj = Aj - 1j * Tj_expanded
-    Sj_fact = spla.splu(csc_matrix(Sj))
-    return Sj_fact
-
-
-def bj_vector(vtxj, eltj, sp, k):
-    bj = np.zeros(vtxj.shape[0], dtype=np.complex128)
-    Mj = mass(vtxj, eltj)
-    bj = Mj @ point_source(sp, k)(vtxj)
-    return bj
-
-
-# --- PARALLEL OPERATORS ---
-
-
-def Pi_operator(nx, J):
-    """
-    Global Pi Operator.
-    Even though we are in parallel, the vector 'x' passed to this
-    is the global interface vector (replicated on all ranks).
-    Therefore, we use the global swapping logic.
-    """
-    vector_size = 2 * nx * (J - 1)
-
-    def matvec(x):
-        result = np.zeros_like(x)
-        for interface_idx in range(J - 1):
-            idx1_start = 2 * interface_idx * nx
-            idx1_end = idx1_start + nx
-            idx2_start = idx1_end
-            idx2_end = idx2_start + nx
-
-            # Swap halves
-            result[idx1_start:idx1_end] = x[idx2_start:idx2_end]
-            result[idx2_start:idx2_end] = x[idx1_start:idx1_end]
-        return result
-
-    return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
-
-
-def g_vector(nx, ny, J, Bj, Cj, bj, Sj_fact):
-    # Compute local contribution: Cj.T @ Bj @ Sj^{-1} @ bj
-    g_size = (J - 1) * nx * 2
-
-    y_j = Sj_fact.solve(bj)
-    # Extract interface values using B_j
-    y_j_interface = Bj @ y_j
-    # C_j maps local interface to global interface
-    local_contribution = Cj.T @ y_j_interface
-
-    # Accumulate contributions from all ranks
-    # The global vector has size S = 2 * nx * (J-1)
-    global_accumulated = np.zeros_like(local_contribution, dtype=np.complex128)
-    comm.Allreduce(local_contribution, global_accumulated, op=MPI.SUM)
-
-    # Apply global Pi operator and scaling
-    # g = -2i * Pi * (Sum of local contributions)
-    Pi = Pi_operator(nx, J)
-    exchanged = Pi @ global_accumulated
-    g = -2j * exchanged
-
-    return g
-
-
-def S_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact):
-    vector_size = 2 * nx * (J - 1)
-
-    def matvec(x):
-        # x is the Global Interface Vector (replicated)
-
-        # Restrict to local interface and map to full interface sizes
-        x_local_interface = Cj @ x
-        x_local_full = Bj.T @ Tj @ x_local_interface  # size S
-
-        # Local Solve
-        y = Sj_fact.solve(x_local_full)
-
-        # Construct local update for the interface
-        # The term is: Cj.T @ (x_j + 2j * Bj @ y)
-        y_interface = x_local_interface + 2j * Bj @ y
-        # expand to global interface size
-        local_vec = Cj.T @ y_interface
-
-        # Accumulate result from all ranks
-        result = np.zeros_like(x, dtype=np.complex128)
-        comm.Allreduce(local_vec, result, op=MPI.SUM)
-
-        return result
-
-    return spla.LinearOperator(
-        (vector_size, vector_size), matvec=matvec, dtype=np.complex128
-    )
-
-
-def interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact):
-    vector_size = 2 * nx * (J - 1)
-    S = S_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact)
-    Pi = Pi_operator(nx, J)
-
-    def matvec(x):
-        # (I + Pi S) x
-        return x + Pi.matvec(S.matvec(x))
-
-    return spla.LinearOperator(
-        (vector_size, vector_size), matvec=matvec, dtype=np.complex128
-    )
-
-
-def uj_solution(Sj_fact, Bj, Cj, Tj, bj, sol_interface, J):
-    # This computes the solution on the specific rank's subdomain
-    # sol_interface is the Global interface solution
-    rhs = Bj.T @ Tj @ (Cj @ sol_interface) + bj
-    u_local = Sj_fact.solve(rhs)
-    return u_local
-
-
-def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
-    sol = starting
+def distributed_fixed_point(g_local, Bj, Tj, Sj_fact, nx, rank, size, w=0.99, maxit=2000, tol=1e-3):
+    x_local = np.zeros_like(g_local)
     residuals = []
-    res = tol + 1
-    it = 0
-    while res > tol and it < maxit:
-        diff = g_vector - I_PIS.matvec(sol)
-        sol = sol + w * diff
-        res = np.linalg.norm(diff)
-        residuals.append(res)
-        it += 1
 
-    return sol, residuals
+    for it in range(maxit):
+        # Apply S locally
+        Sx = S_local(x_local, Bj, Tj, Sj_fact)
+        # Apply Pi (Communication)
+        PiSx = Pi_local(Sx, nx, rank, size)
+        # (I + PiS)x
+        Ax = x_local + PiSx
+
+        # Residual and Global Reduction
+        diff = g_local - Ax
+        local_sq_norm = np.sum(np.abs(diff) ** 2)
+        global_res = np.sqrt(comm.allreduce(local_sq_norm, op=MPI.SUM))
+        residuals.append(global_res)
+
+        if global_res < tol:
+            break
+
+        x_local += w * diff
+
+    return x_local, residuals
 
 
 def u_global_gather(nx, ny, J, u_local, rank):
-    """
-    Gather local solutions from all ranks and reconstruct the global solution.
-    """
-    # Gather all local u vectors to rank 0
-    # We gather as a list of numpy arrays
     u_list = comm.gather(u_local, root=0)
-
     if rank == 0:
-        # Build the global Reconstruct matrix R
-        R = None
-        for r_idx in range(J):
+        vtx_global, elt_global = mesh(nx, ny, 1, 2)
+        u_final = np.zeros(vtx_global.shape[0], dtype=np.complex128)
+        counts = np.zeros(vtx_global.shape[0])
+        for r_idx, u_r in enumerate(u_list):
             Rj = Rj_matrix(nx, ny, r_idx, J)
-            if R is None:
-                R = Rj.T
-            else:
-                R = np.hstack((R, Rj.T))
-        R = R.T
-
-        # Concatenate received solutions
-        uu_global_concat = np.hstack(u_list)
-
-        Ru = R.T @ uu_global_concat
-        d = np.sum(R * R, axis=0)
-        u_final = Ru / d
-        return u_final
+            u_final += Rj.T @ u_r
+            counts += np.sum(Rj, axis=0)
+        return u_final / counts
+    return None
 
 
 if __name__ == "__main__":
+    Lx, Ly = 1, 2
+    nx, ny = int(1 + Lx * 32), int(1 + Ly * 32)
+    k, ns = 16, 8
     np.random.seed(1234)
-    Lx = 1
-    Ly = 2
-    nx = int(1 + Lx * 32)
-    ny = int(1 + Ly * 32)
-    k = 16
-    ns = 8
-    # Ensure source points are same on all ranks
-    sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in np.arange(ns)]
+    sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in range(ns)]
 
-    # 1. Local Setup
-    vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
-    belt_phys, belt_art = local_boundary(nx, ny, j, J)
+    # Setup local matrices
+    vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, rank, size)
+    belt_phys, belt_art = local_boundary(nx, ny, rank, size)
 
-    M = mass(vtx_loc, elt_loc)
-    Mb = mass(vtx_loc, belt_phys)
-    K = stiffness(vtx_loc, elt_loc)
-    Aj = K - k**2 * M - 1j * k * Mb
-
-    Bj = Bj_matrix(nx, ny, j, J, belt_art)
-    Cj = Cj_matrix(nx, ny, j, J)
+    Al = stiffness(vtx_loc, elt_loc)
+    Ml = mass(vtx_loc, elt_loc)
+    Mli = mass(vtx_loc, belt_phys)
+    Aj = ( Al - k**2 * Ml - 1j * k * Mli)
+    Bj = Bj_matrix(nx, ny, rank, size, belt_art)
     Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
     Sj_fact = Sj_factorization(Aj, Tj, Bj)
+
+    # Setup distributed RHS g
     bj = bj_vector(vtx_loc, elt_loc, sp, k)
+    yj_interf = Bj @ Sj_fact.solve(bj)
+    g_local = g_vector_local(yj_interf, nx, rank, size)
 
-    # 2. Construct Global/Parallel Operators
-    g = g_vector(nx, ny, J, Bj, Cj, bj, Sj_fact)
-    I_PIS = interface_operator(nx, ny, J, Bj, Tj, Cj, Sj_fact)
-
-    global_interface_size = 2 * nx * (J - 1)
-    starting_sol = np.zeros(global_interface_size, dtype=np.complex128)
-
-    # ---------------------------------------------------------
-    # Solver: Fixed Point
-    # ---------------------------------------------------------
+    # Solve
     comm.Barrier()
-    t0_fp = time.perf_counter()
+    t0 = time.perf_counter()
+    sol_int, res_hist = distributed_fixed_point( g_local, Bj, Tj, Sj_fact, nx, rank, size )
+    solve_time = time.perf_counter() - t0
 
-    # Run Fixed Point
-    interf_sol_fp, residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
-
-    comm.Barrier()
-    tfp = time.perf_counter() - t0_fp
-
-    # ---------------------------------------------------------
-    # Solver: GMRES
-    # ---------------------------------------------------------
-    # Prepare callback to store residuals for plotting
-    res_gmres = []
-
-    def gmres_callback(rk):
-        res_gmres.append(rk)
-
-    comm.Barrier()
-    t0_gmres = time.perf_counter()
-
-    # Solve using scipy GMRES with the LinearOperator
-    # restart=30 is standard; maxiter is the max number of restarts * restart size
-    sol_gmres, info = spla.gmres(
-        I_PIS,
-        g,
-        x0=starting_sol,
-        rtol=1e-8,
-        atol=0,
-        restart=30,
-        maxiter=500,
-        callback=gmres_callback,
-    )
-    comm.Barrier()
-    t_gmres = time.perf_counter() - t0_gmres
-
-    # ---------------------------------------------------------
-    # Recover Local Solution (Using GMRES result)
-    # ---------------------------------------------------------
-
-    u_local = uj_solution(Sj_fact, Bj, Cj, Tj, bj, sol_gmres, J)
-
-    # Gather Global Solution
-    u_final = u_global_gather(nx, ny, J, u_local, rank)
+    # Reconstruct volume solution
+    u_local = uj_solution(Sj_fact, bj, Bj, Tj, sol_int)
+    u_final = u_global_gather(nx, ny, size, u_local, rank)
 
     if rank == 0:
-        print(f"--- Results (MPI Size {J}) ---")
-        print(f"Fixed Point: {len(residuals_fp)} iterations, {tfp:.4f} s")
-        print(
-            f"GMRES:       {len(res_gmres)} iterations, {t_gmres:.4f} s (Info: {info})"
-        )
-
-        # Plot Residuals Comparison
+        print(f"Converged in {len(res_hist)} iterations. Time: {solve_time:.4f}s")
         plt.figure()
-        plt.semilogy(residuals_fp, label="Fixed Point ($\\omega=0.5$)")
-        plt.semilogy(res_gmres, label="GMRES")
+        plot_mesh(mesh(nx, ny, Lx, Ly)[0], mesh(nx, ny, Lx, Ly)[1], np.real(u_final))
+        plt.title("Parallel Fixed Point Solution")
+        plt.savefig("../plots/mpi_sol_real.png")
+
+        plt.figure()
+        plot_mesh(mesh(nx, ny, Lx, Ly)[0], mesh(nx, ny, Lx, Ly)[1], np.abs(u_final))
+        plt.title("Parallel Fixed Point Solution")
+        plt.savefig("../plots/mpi_sol_abs.png")
+
+        plt.figure()
+        plt.semilogy(res_hist)
         plt.xlabel("Iteration")
-        plt.ylabel("Residual Norm (Relative)")
-        plt.grid(True, which="both", linestyle="--")
-        plt.legend()
-        plt.title(f"Convergence Comparison (J={J})")
-        plt.savefig("comparison_residuals.png", dpi=300, bbox_inches="tight")
+        plt.ylabel("Residual")
+        plt.grid(True, which="both")
+        plt.savefig("../plots/mpi_res_fp.png", dpi=300, bbox_inches="tight")
         plt.close()
-        print("Saved convergence plot to 'comparison_residuals.png'")
-
-        # Plot Solution Real Part
-        vtx_global, elt_global = mesh(nx, ny, Lx, Ly)
-        plt.figure()
-        plot_mesh(vtx_global, elt_global, np.real(u_final))
-        plt.colorbar()
-        plt.title(f"Global Solution Real Part (GMRES, J={J})")
-        plt.savefig("solution_real_MPI.png", dpi=300, bbox_inches="tight")
-        plt.close()
-        print("Saved solution plot to 'solution_real_MPI.png'")
