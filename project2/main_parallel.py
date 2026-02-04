@@ -1,3 +1,13 @@
+"""
+========================================================================
+                        Domain Decomposition Project
+
+                Davide Villani     -     Emanuele Caruso
+========================================================================
+"""
+
+
+
 from math import pi
 import time
 import numpy as np
@@ -103,7 +113,7 @@ def u_global_gather(nx, ny, J, u_local, rank):
 
 if __name__ == "__main__":
     Lx, Ly = 1, 2
-    nx, ny = int(1 + Lx * 32), int(1 + Ly * 32)
+    nx, ny = int(1 + Lx * 128), int(1 + Ly * 128)
     k, ns = 16, 8
     np.random.seed(1234)
     sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in range(ns)]

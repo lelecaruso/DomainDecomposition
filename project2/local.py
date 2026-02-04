@@ -1,3 +1,12 @@
+"""
+========================================================================
+                        Domain Decomposition Project
+
+                Davide Villani     -     Emanuele Caruso
+========================================================================
+"""
+
+
 from math import pi
 import time
 import numpy as np

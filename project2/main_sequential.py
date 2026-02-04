@@ -1,3 +1,12 @@
+"""
+========================================================================
+                        Domain Decomposition Project
+
+                Davide Villani     -     Emanuele Caruso
+========================================================================
+"""
+
+
 from math import pi
 import time
 import numpy as np
@@ -176,149 +185,88 @@ def u_global(uu_gmres):
 
 
 if __name__ == "__main__":
+    import time
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import scipy.sparse.linalg as spla
+
     np.random.seed(1234)
-    Lx = 1
-    Ly = 2
-    nx = int(1 + Lx * 64)
-    ny = int(1 + Ly * 64)
-    j = 2
-    J = 4
+
+    Lx, Ly = 1, 2
     k = 16
     ns = 8
-    sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in np.arange(ns)]
 
-    Bj_list = []
-    Cj_list = []
-    Tj_list = []
-    Sj_fact_list = []
-    bj_list = []
-    Rj_list = []
+    Js = [2, 4, 8, 12, 16]
 
-    for j in range(J):
-        vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
-        belt_phys, belt_art = local_boundary(nx, ny, j, J)
-        M = mass(vtx_loc, elt_loc)
-        Mb = mass(vtx_loc, belt_phys)
-        K = stiffness(vtx_loc, elt_loc)
-        Aj = K - k**2 * M - 1j * k * Mb
-        Bj = Bj_matrix(nx, ny, j, J, belt_art)
-        Cj = Cj_matrix(nx, ny, j, J)
-        Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
-        Sj = Sj_factorization(Aj, Tj, Bj)
+    STUDY = "fixed_dofs_per_sub"      
 
-        bj = bj_vector(vtx_loc, elt_loc, sp, k)
+    if STUDY == "fixed_domain":
+        nx = int(1 + Lx * 64)
+        ny = int(1 + Ly * 64)
+    else:
+        dofs_per_sub = 8000          # approx per subdomain
 
-        Bj_list.append(Bj)
-        Cj_list.append(Cj)
-        Tj_list.append(Tj)
-        Sj_fact_list.append(Sj)
-        bj_list.append(bj)
+    sp = [np.random.rand(3) * [Lx, Ly, 50.0] for _ in range(ns)]
 
-    g = g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list)
-    I_PIS = interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list)
+    gmres_its = []
+    total_dofs = []
 
-    residuals_gmres = []
-    residuals_fp = []
+    for J in Js:
+        print(f"\n=== Number of subdomains J = {J} ===")
 
-    # GMRES
-    def callback(x):
-        residuals_gmres.append(x)
+        if STUDY == "fixed_dofs_per_sub":
+            ndofs_tot = J * dofs_per_sub
+            nx = int(np.sqrt(ndofs_tot / Ly))
+            ny = int(Ly * nx)
 
-    t0 = time.perf_counter()
-    interf_sol_gmres, _ = spla.gmres(
-        I_PIS,
-        g,
-        atol=1e-8,
-        restart=50,
-        maxiter=500,
-        callback=callback,
-        callback_type="pr_norm",
-    )
-    tgmrs = time.perf_counter() - t0
+        Bj_list = []
+        Cj_list = []
+        Tj_list = []
+        Sj_fact_list = []
+        bj_list = []
 
-    uu_gmres = uj_solution(
-        Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, interf_sol_gmres, J
-    )
-    u_gmres = u_global(uu_gmres)
+        for j in range(J):
+            vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
+            belt_phys, belt_art = local_boundary(nx, ny, j, J)
 
-    # FIXED POINT
-    starting_sol = np.zeros(interf_sol_gmres.shape[0])
+            M = mass(vtx_loc, elt_loc)
+            Mb = mass(vtx_loc, belt_phys)
+            K = stiffness(vtx_loc, elt_loc)
 
-    t0 = time.perf_counter()
-    interf_sol_fp, residuals_fp = fixed_point(0.5, starting_sol, g, I_PIS)
-    tfp = time.perf_counter() - t0
+            Aj = K - k**2 * M - 1j * k * Mb
+            Bj = Bj_matrix(nx, ny, j, J, belt_art)
+            Cj = Cj_matrix(nx, ny, j, J)
+            Tj = Tj_matrix(vtx_loc, belt_art, Bj, k)
+            Sj = Sj_factorization(Aj, Tj, Bj)
 
-    uu_fp = uj_solution(
-        Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, interf_sol_fp, J
-    )
-    u_fp = u_global(uu_fp)
+            bj = bj_vector(vtx_loc, elt_loc, sp, k)
 
-    # error between solvers
-    print(
-        "Gmres vs Fp RELATIVE ERROR NORM = ",
-        np.linalg.norm(u_gmres - u_fp) / np.linalg.norm(u_gmres),
-    )
-    print(f"Elapsed time: \ngmres -> { tgmrs*1000 } ms \nfp ----> { tfp*1000 } ms  \n")
+            Bj_list.append(Bj)
+            Cj_list.append(Cj)
+            Tj_list.append(Tj)
+            Sj_fact_list.append(Sj)
+            bj_list.append(bj)
 
-    # plot both residuals
-    plt.figure()
-    plt.semilogy(residuals_gmres)
-    plt.xlabel("Iteration")
-    plt.ylabel("Residual")
-    plt.grid(True, which="both")
-    plt.savefig("../plots/seq_res_gmres.png", dpi=300, bbox_inches="tight")
-    plt.close()
+        g = g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list)
+        I_PIS = interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list)
 
-    plt.figure()
-    plt.semilogy(residuals_fp)
-    plt.xlabel("Iteration")
-    plt.ylabel("Residual")
-    plt.grid(True, which="both")
-    plt.savefig("../plots/seq_res_fp.png", dpi=300, bbox_inches="tight")
-    plt.close()
+        residuals_gmres = []
 
-    vtx, elt = mesh(nx,ny,Lx,Ly)
+        def callback(res):
+            residuals_gmres.append(res)
 
-    plt.figure()
-    plot_mesh(vtx, elt, np.real(u_fp))
-    plt.colorbar()
-    plt.savefig("../plots/seq_sol_real_fp.png", dpi=300, bbox_inches="tight")
-    plt.close()
-    
-    plt.figure()
-    plot_mesh(vtx, elt, np.abs(u_fp))
-    plt.colorbar()
-    plt.savefig("../plots/seq_sol_abs_fp.png", dpi=300, bbox_inches="tight")
-    plt.close()
+        spla.gmres(
+            I_PIS,
+            g,
+            atol=1e-8,
+            restart=50,
+            maxiter=500,
+            callback=callback,
+            callback_type="pr_norm",
+        )
 
+        gmres_its.append(len(residuals_gmres))
+        total_dofs.append(nx * ny)
 
-"""
-        # --- Plot 1: mesh ---
-        plt.figure()
-        plot_mesh(vtx_loc, elt_loc)  # slow for fine meshes
-        plt.savefig("mesh.png", dpi=300, bbox_inches="tight")
-        plt.close()
-
-        # --- Plot 2: real part ---
-        plt.figure()
-        plot_mesh(vtx_loc, elt_loc, np.real(x))
-        plt.colorbar()
-        plt.savefig("solution_real.png", dpi=300, bbox_inches="tight")
-        plt.close()
-
-        # --- Plot 3: magnitude ---
-        plt.figure()
-        plot_mesh(vtx_loc, elt_loc, np.abs(x))
-        plt.colorbar()
-        plt.savefig("solution_abs.png", dpi=300, bbox_inches="tight")
-        plt.close()
-
-        # --- Plot 4: residual history ---
-        plt.figure()
-        plt.semilogy(residuals)
-        plt.xlabel("Iteration")
-        plt.ylabel("Residual")
-        plt.grid(True, which="both")
-        plt.savefig("residuals.png", dpi=300, bbox_inches="tight")
-        plt.close()
-"""
+        print(f"GMRES iterations = {gmres_its[-1]}")
+        print(f"Total DoFs = {nx * ny}")
