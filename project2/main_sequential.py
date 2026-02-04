@@ -6,7 +6,6 @@
 ========================================================================
 """
 
-
 from math import pi
 import time
 import numpy as np
@@ -18,8 +17,15 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from mpi4py import MPI
 from code import mesh, mass, stiffness, plot_mesh, point_source, boundary
-from local import local_mesh, local_boundary, Bj_matrix, Tj_matrix, Sj_factorization, Rj_matrix, bj_vector
-
+from local import (
+    local_mesh,
+    local_boundary,
+    Bj_matrix,
+    Tj_matrix,
+    Sj_factorization,
+    Rj_matrix,
+    bj_vector,
+)
 
 
 def Cj_matrix(nx, ny_glob, j, J):
@@ -66,6 +72,7 @@ def Cj_matrix(nx, ny_glob, j, J):
 
     return Cj
 
+
 def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
     # Initialize global interface vector
     g_size = (J - 1) * nx * 2
@@ -84,6 +91,7 @@ def g_vector(nx, ny, J, Bj_list, Cj_list, bj_list, Sj_fact_list):
 
     return g
 
+
 def S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
 
@@ -101,6 +109,7 @@ def S_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
         return result
 
     return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
+
 
 def Pi_operator(nx, J):
     vector_size = 2 * nx * (J - 1)  # Each interface seen from both sides
@@ -123,6 +132,7 @@ def Pi_operator(nx, J):
 
     return spla.LinearOperator((vector_size, vector_size), matvec=matvec)
 
+
 def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
 
     vector_size = 2 * nx * (J - 1)
@@ -137,6 +147,7 @@ def interface_operator(nx, ny, J, Bj_list, Tj_list, Cj_list, Sj_fact_list):
         (vector_size, vector_size), matvec=matvec, dtype=np.complex128
     )
 
+
 def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J):
     sols = None
     for j in range(J):
@@ -148,6 +159,7 @@ def uj_solution(Sj_fact_list, Bj_list, Cj_list, Tj_list, bj_list, sol, J):
         else:
             sols = np.hstack((sols, x))
     return sols
+
 
 def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
     sol = starting
@@ -162,6 +174,7 @@ def fixed_point(w, starting, g_vector, I_PIS, maxit=500, tol=1e-8):
         it += 1
 
     return sol, residuals
+
 
 def u_global(uu_gmres):
     # build the pseudoinverse to compute global u
@@ -179,8 +192,6 @@ def u_global(uu_gmres):
     u = Ru / d
 
     return u
-
-
 
 
 if __name__ == "__main__":
@@ -268,6 +279,37 @@ if __name__ == "__main__":
     )
     print(f"Elapsed time: \ngmres -> { tgmrs*1000 } ms \nfp ----> { tfp*1000 } ms  \n")
 
+    # Compute all local solutions using uj_solution (from GMRES interface solution)
+    uu_all = uj_solution(
+        Sj_fact_list,
+        Bj_list,
+        Cj_list,
+        Tj_list,
+        bj_list,
+        interf_sol_gmres,
+        J,
+    )
+
+    plt.figure()
+
+    offset = 0
+    for j in range(J):
+        vtx_loc, elt_loc = local_mesh(Lx, Ly, nx, ny, j, J)
+        nloc = vtx_loc.shape[0]
+
+        # Extract u_j
+        u_j = uu_all[offset : offset + nloc]
+        offset += nloc
+
+        # Plot local solution independently
+        plot_mesh(vtx_loc, elt_loc, np.real(u_j))
+
+    plt.colorbar()
+    plt.title("Piecewise Local Solutions (Real Part)")
+    plt.axis("equal")
+    plt.savefig("../plots/seq_sol_piecewise.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
     # plot both residuals
     plt.figure()
     plt.semilogy(residuals_gmres)
@@ -285,14 +327,14 @@ if __name__ == "__main__":
     plt.savefig("../plots/seq_res_fp.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    vtx, elt = mesh(nx,ny,Lx,Ly)
+    vtx, elt = mesh(nx, ny, Lx, Ly)
 
     plt.figure()
     plot_mesh(vtx, elt, np.real(u_fp))
     plt.colorbar()
     plt.savefig("../plots/seq_sol_real_fp.png", dpi=300, bbox_inches="tight")
     plt.close()
-    
+
     plt.figure()
     plot_mesh(vtx, elt, np.abs(u_fp))
     plt.colorbar()
